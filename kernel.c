@@ -1,4 +1,4 @@
-// kernel.c - TinyOS. Your own tiny OS. No Linux code inside.
+// kernel.c - maddis-os. Your own tiny OS. No Linux code inside.
 //
 //   Core 0 = the OS.  It owns the screen and keyboard. It never sleeps.
 //   Core 1 = the app. It talks to the OS through the mailbox.
@@ -13,6 +13,9 @@
 static void putc(char c) { while ((UART_STATUS & 0x20) == 0) {} UART_DATA = c; }
 static void print(const char *s) { while (*s) putc(*s++); }
 static int key_ready(void) { return UART_STATUS & 0x01; }
+
+#define BLUE  "\033[1;38;5;45m"   // neon blue
+#define RESET "\033[0m"
 
 // ---------- small text helpers (no C library here, so we make our own) ----------
 static int same(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
@@ -172,6 +175,68 @@ static void bytes(const char *word) {
     }
 }
 
+// ---------- THE FILE SYSTEM (simple, Blow style) ----------
+// Just a list of files in memory. No folders inside folders, no layers.
+// A file = a name + its bytes. That's it.
+// (Lives in memory, so files disappear when maddis-os turns off.)
+#define MAX_FILES 16
+#define NAME_LEN  16
+#define DATA_LEN  128
+static struct file { int used; char name[NAME_LEN]; char data[DATA_LEN]; int size; } files[MAX_FILES];
+
+static struct file *find_file(const char *name) {
+    for (int i = 0; i < MAX_FILES; i++) if (files[i].used && same(files[i].name, name)) return &files[i];
+    return 0;
+}
+static void copy_max(char *d, const char *s, int max) { int i = 0; while (s[i] && i < max - 1) { d[i] = s[i]; i++; } d[i] = 0; }
+static int length(const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+static struct file *file_write(const char *name, const char *text) {
+    struct file *f = find_file(name);
+    for (int i = 0; !f && i < MAX_FILES; i++) if (!files[i].used) f = &files[i];
+    if (!f) return 0;
+    f->used = 1;
+    copy_max(f->name, name, NAME_LEN);
+    copy_max(f->data, text, DATA_LEN);
+    f->size = length(f->data);
+    return f;
+}
+
+static void file_list(void) {
+    int any = 0;
+    for (int i = 0; i < MAX_FILES; i++) if (files[i].used) {
+        print("  " BLUE); print(files[i].name); print(RESET "   ");
+        print_num(files[i].size); print(" bytes\r\n");
+        any = 1;
+    }
+    if (!any) print("  (no files)\r\n");
+}
+
+static void file_read(const char *name) {
+    struct file *f = find_file(name);
+    if (!f) { print("  no file called "); print(name); print("\r\n"); return; }
+    print("  "); print(f->data); print("\r\n");
+}
+
+static void file_delete(const char *name) {
+    struct file *f = find_file(name);
+    if (!f) { print("  no file called "); print(name); print("\r\n"); return; }
+    f->used = 0;
+    print("  deleted "); print(name); print("\r\n");
+}
+
+// split "write notes.txt hello there" into name and text
+static void write_command(const char *args) {
+    char name[NAME_LEN]; int i = 0;
+    while (*args && *args != ' ' && i < NAME_LEN - 1) name[i++] = *args++;
+    name[i] = 0;
+    if (*args == ' ') args++;
+    if (!name[0] || !*args) { print("  type: write notes.txt hello there\r\n"); return; }
+    struct file *f = file_write(name, args);
+    if (!f) { print("  disk full (16 files max)\r\n"); return; }
+    print("  saved "); print(f->name); print(" ("); print_num(f->size); print(" bytes)\r\n");
+}
+
 static void command(char *line) {
     if (line[0] == '\'' || line[0] == '"') {           // so 'help' works too
         char *p = line; while (p[1]) { p[0] = p[1]; p++; } *p = 0;
@@ -184,19 +249,25 @@ static void command(char *line) {
         print("  echo hi       print what you type\r\n");
         print("  bytes hi      see what letters look like as bytes\r\n");
         print("  ls            list files\r\n");
+        print("  write a.txt hi   make a file called a.txt with hi inside\r\n");
+        print("  cat a.txt     show what is in a file\r\n");
+        print("  rm a.txt      delete a file\r\n");
         print("  whoami        who you are\r\n");
         print("  uname         what OS this is\r\n");
         print("  cores         show what each core is doing\r\n");
         print("  run 20        core 1 sends 20 messages through the mailbox\r\n");
         print("  speedtest     old trap way vs new mailbox way\r\n");
-        print("  exit          turn off TinyOS and go back to Linux\r\n");
+        print("  exit          turn off maddis-os and go back to Linux\r\n");
     }
     else if (same(line, "clear"))     print("\033[2J\033[H");
     else if (starts(line, "echo"))    { print("  "); print(line[4] ? line + 5 : ""); print("\r\n"); }
     else if (starts(line, "bytes"))   bytes(line[5] ? line + 6 : "");
-    else if (same(line, "ls"))        print("  (no files yet - TinyOS has no disk)\r\n");
+    else if (same(line, "ls"))        file_list();
+    else if (starts(line, "write"))   write_command(line[5] ? line + 6 : "");
+    else if (starts(line, "cat"))     file_read(line[3] ? line + 4 : "");
+    else if (starts(line, "rm"))      file_delete(line[2] ? line + 3 : "");
     else if (same(line, "whoami"))    print("  user\r\n");
-    else if (same(line, "uname"))     print("  TinyOS (not Linux, built from scratch)\r\n");
+    else if (same(line, "uname"))     print("  maddis-os (not Linux, built from scratch)\r\n");
     else if (same(line, "hello"))     print("  hello from your own OS!\r\n");
     else if (same(line, "speedtest")) speedtest();
     else if (same(line, "cores")) {
@@ -212,30 +283,41 @@ static void command(char *line) {
         app_count = n;
         STORE(app_job, JOB_TEXT);
     }
-    else if (same(line, "exit"))      { print("  bye!\r\n"); POWER = 0x5555; }
+    else if (same(line, "exit"))      { print("  bye!\r\n"); POWER = 0x5555; for (;;) {} }
     else { print("  unknown command: "); print(line); print("   (type help)\r\n"); }
 }
+
+#define PROMPT BLUE "maddis-os> " RESET
 
 static int ctrl_c = 0;   // how many times Ctrl+C was pressed in a row
 
 void kmain(void) {
-    print("\r\n  TinyOS is alive!  core 0 = OS, core 1 = app\r\n");
+    file_write("readme.txt", "welcome to maddis-os! try: write a.txt hello");
+    print("\033[2J\033[H" BLUE);
+    print("\r\n");
+    print("   __  __           _     _ _                     \r\n");
+    print("  |  \\/  | __ _  __| | __| (_)___        ___  ___ \r\n");
+    print("  | |\\/| |/ _` |/ _` |/ _` | / __|_____ / _ \\/ __|\r\n");
+    print("  | |  | | (_| | (_| | (_| | \\__ \\_____| (_) \\__ \\\r\n");
+    print("  |_|  |_|\\__,_|\\__,_|\\__,_|_|___/      \\___/|___/\r\n");
+    print(RESET "\r\n");
+    print("  core 0 = OS, core 1 = app. Built from scratch, no Linux inside.\r\n");
     print("  Type help to see commands. Press Ctrl+C twice to leave.\r\n\r\n");
-    print("tinyos> ");
+    print(PROMPT);
 
     char line[64], msg[48];
     int n = 0;
     for (;;) {                                           // the OS never sleeps
         if (mailbox_take(msg)) {                         // 1) check the mailbox
             print("  [mailbox] "); print(msg); print("\r\n");
-            if (same(msg, "done!")) print("tinyos> ");
+            if (same(msg, "done!")) print(PROMPT);
         }
         if (key_ready()) {                               // 2) check the keyboard
             char c = UART_DATA;
             if (c == 3) {                                // Ctrl+C
-                if (ctrl_c) { print("\r\n  bye!\r\n"); POWER = 0x5555; }
+                if (ctrl_c) { print("\r\n  bye!\r\n"); POWER = 0x5555; for (;;) {} }
                 ctrl_c = 1;
-                print("^C   (press Ctrl+C again to exit)\r\ntinyos> ");
+                print("^C   (press Ctrl+C again to exit)\r\n" PROMPT);
                 n = 0;
                 continue;
             }
@@ -245,7 +327,7 @@ void kmain(void) {
                 line[n] = 0;
                 if (n > 0) command(line);
                 n = 0;
-                if (LOAD(app_job) != JOB_TEXT) print("tinyos> ");
+                if (LOAD(app_job) != JOB_TEXT) print(PROMPT);
             }
             else if ((c == 127 || c == 8) && n > 0) { n--; print("\b \b"); }
             else if (c >= 32 && c < 127 && n < 63) { line[n++] = c; putc(c); }

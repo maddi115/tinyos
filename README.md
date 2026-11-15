@@ -1,4 +1,4 @@
-# TinyOS
+# maddis-os
 
 A tiny operating system built from scratch, inspired by Jonathan Blow's idea
 of a simpler OS. No Linux code inside.
