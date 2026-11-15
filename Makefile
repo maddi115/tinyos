@@ -12,3 +12,6 @@ run: kernel.elf
 
 clean:
 > rm -f kernel.elf
+race:
+> qemu-system-riscv64 -machine virt -smp 2 -m 256M -nographic -kernel race/linux-Image -initrd race/race-initrd.gz -append "console=ttyS0 quiet"
+.PHONY: run clean race
