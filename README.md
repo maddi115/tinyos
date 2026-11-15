@@ -12,4 +12,4 @@ of a simpler OS. No Linux code inside.
     sudo apt install -y gcc-riscv64-unknown-elf qemu-system-misc
     make run
 
-Type `help` for commands and `exit` to leave.
+Type `help` for commands. Press Ctrl+C twice to leave.
