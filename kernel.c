@@ -216,20 +216,30 @@ static void command(char *line) {
     else { print("  unknown command: "); print(line); print("   (type help)\r\n"); }
 }
 
+static int ctrl_c = 0;   // how many times Ctrl+C was pressed in a row
+
 void kmain(void) {
     print("\r\n  TinyOS is alive!  core 0 = OS, core 1 = app\r\n");
-    print("  Type help to see commands. Type exit to leave.\r\n\r\n");
+    print("  Type help to see commands. Press Ctrl+C twice to leave.\r\n\r\n");
     print("tinyos> ");
 
     char line[64], msg[48];
     int n = 0;
     for (;;) {                                           // the OS never sleeps
-        while (mailbox_take(msg)) {                      // 1) check the mailbox
+        if (mailbox_take(msg)) {                         // 1) check the mailbox
             print("  [mailbox] "); print(msg); print("\r\n");
             if (same(msg, "done!")) print("tinyos> ");
         }
         if (key_ready()) {                               // 2) check the keyboard
             char c = UART_DATA;
+            if (c == 3) {                                // Ctrl+C
+                if (ctrl_c) { print("\r\n  bye!\r\n"); POWER = 0x5555; }
+                ctrl_c = 1;
+                print("^C   (press Ctrl+C again to exit)\r\ntinyos> ");
+                n = 0;
+                continue;
+            }
+            ctrl_c = 0;
             if (c == '\r' || c == '\n') {
                 print("\r\n");
                 line[n] = 0;
