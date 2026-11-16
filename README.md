@@ -138,12 +138,44 @@ Type `appfiles` to watch it happen. 2 file jobs, 0 traps.
 | `pwd` | show which folder you're in |
 | `size` | how many bytes maddis-os and your files use |
 | `appfiles` | the app on core 1 saves and reads a file through the mailbox |
+| `badapp` | a bad app tries to read your files directly. The chip's walls stop it |
+| `send hi` | send a message to the other maddis-os window |
+| `sendfile a.txt` | send a file to the other maddis-os window |
+| `net` | network status |
 | `whoami` | who you are |
 | `uname` | what OS this is |
 | `cores` | show what each core is doing |
 | `run 20` | core 1 sends 20 messages through the mailbox |
 | `speedtest` | old trap way vs. new mailbox way |
 | `exit` or **Ctrl+C twice** | turn off maddis-os (files stay on the disk) |
+
+---
+
+## The walls (safety)
+
+The app on core 1 runs in **user mode**, locked in a room by the chip itself (RISC-V **PMP**):
+
+| Memory | The app can... |
+|---|---|
+| OS code | read and run it, but not change it |
+| Its own room (mailboxes, its stack) | read and write |
+| Everything else (your files, the disk, the screen) | **nothing. The chip blocks it** |
+
+If the app breaks a rule, the chip stops it, the OS prints a `[WALL]` message, and the app is restarted.
+Your files stay safe. Type `badapp` to see it. The walls cost well under 1 KB, because the chip does the checking.
+
+---
+
+## Two maddis-os talking to each other
+
+Two windows, connected by a pretend network cable. No internet layers (no IP, no TCP):
+just raw packets in our own tiny format that starts with `MDOS`.
+
+1. In one Ubuntu window: `make a`  (start this one first)
+2. In a second Ubuntu window: `make b`
+3. In either one: `send hello`, or `sendfile poem.txt`
+
+Window B keeps its own disk, called `disk-b.img`.
 
 ---
 
@@ -170,14 +202,12 @@ Leave with **Ctrl+C twice**.
 ## What it can't do (yet)
 
 - Small disk: 16 files of 1 KB each.
-- No internet.
+- No internet. The network only talks to another maddis-os.
 - No graphics, windows or mouse. Just text.
-- No protection: the app could touch the OS's memory if it wanted to.
 - Only runs on a pretend RISC-V computer (QEMU), not on your real PC's chip.
 
 ## Ideas for next steps
 
-- **Boxes:** lock the app so it can't touch the OS's memory (needed for safe AI agents).
 - **Bigger disk:** more and bigger files.
 - **AMD version:** boot from a USB stick on a real PC.
 - **More apps on more cores**, each with its own mailbox.

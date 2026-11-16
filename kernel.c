@@ -48,12 +48,16 @@ static void copy_max(char *d, const char *s, int max) { int i = 0; while (s[i] &
 static int length(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static void copy_bytes(void *d, const void *s, unsigned long n) { u8 *a = d; const u8 *b = s; while (n--) *a++ = *b++; }
 
+// APP_MEM = memory the app on core 1 is allowed to touch (its "room").
+// Everything else (your files, the disk, the screen) is behind a wall.
+#define APP_MEM __attribute__((section(".bss.app")))
+
 #define LOAD(x)     __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
 #define STORE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELEASE)
 
 // ---------- THE MAILBOX for text messages (app -> OS -> screen) ----------
 #define SLOTS 16
-static struct { unsigned head, tail; char slot[SLOTS][64]; } mailbox;
+static struct { unsigned head, tail; char slot[SLOTS][64]; } mailbox APP_MEM;
 static void mailbox_send(const char *text) {
     unsigned h = mailbox.head;
     while (h - LOAD(mailbox.tail) == SLOTS) {}
@@ -68,44 +72,65 @@ static int mailbox_take(char *out) {
     return 1;
 }
 
-// ================= THE DISK =================
-// A tiny driver for QEMU's "virtio" disk. Only core 0 uses it.
-// The whole file system is saved as ONE block of raw bytes (no layers).
+// ================= VIRTIO: QEMU's simple disk and network cards =================
+// Only core 0 (the OS) talks to these. Each card has a "queue": a ring of slots
+// where we leave jobs, and the card leaves back what it finished. (A mailbox again!)
 #define VIRTIO_BASE 0x10001000UL
-static volatile u32 *vio = 0;                // the disk chip's control panel
-#define VREG(off) vio[(off) / 4]
-
 #define QNUM 8
 struct vq_desc  { u64 addr; u32 len; u16 flags; u16 next; };
-struct vq_avail { u16 flags; u16 idx; u16 ring[QNUM]; u16 unused; };
-struct vq_used  { u16 flags; u16 idx; struct { u32 id; u32 len; } ring[QNUM]; u16 unused; };
-static struct vq_desc  desc[QNUM]  __attribute__((aligned(4096)));
-static struct vq_avail avail       __attribute__((aligned(4096)));
-static struct vq_used  used        __attribute__((aligned(4096)));
+struct vq {
+    struct vq_desc desc[QNUM];
+    struct { u16 flags; u16 idx; u16 ring[QNUM]; u16 unused; } avail __attribute__((aligned(4)));
+    struct { u16 flags; u16 idx; struct { u32 id; u32 len; } ring[QNUM]; u16 unused; } used __attribute__((aligned(4)));
+    u16 seen;
+} __attribute__((aligned(4096)));
+
+#define R(dev, off) (dev)[(off) / 4]
+static volatile u32 *find_card(u32 kind) {             // kind: 1 = network, 2 = disk
+    for (int i = 0; i < 8; i++) {
+        volatile u32 *r = (volatile u32 *)(VIRTIO_BASE + i * 0x1000UL);
+        if (r[0] == 0x74726976 && r[1] == 2 && r[2] == kind) return r;
+    }
+    return 0;
+}
+static int card_start(volatile u32 *d) {
+    R(d, 0x070) = 0;                                    // reset
+    R(d, 0x070) = 1 | 2;                                // "I see you" + "I have a driver"
+    R(d, 0x024) = 0; R(d, 0x020) = 0;                   // no extra features
+    R(d, 0x024) = 1; R(d, 0x020) = 1;                   // but speak modern virtio
+    R(d, 0x070) = 1 | 2 | 8;                            // features OK
+    return (R(d, 0x070) & 8) != 0;
+}
+static int card_queue(volatile u32 *d, int q, struct vq *v) {
+    R(d, 0x030) = q;
+    if (R(d, 0x034) < QNUM) return 0;
+    R(d, 0x038) = QNUM;
+    R(d, 0x080) = (u32)(u64)v->desc;    R(d, 0x084) = (u32)((u64)v->desc >> 32);
+    R(d, 0x090) = (u32)(u64)&v->avail;  R(d, 0x094) = (u32)((u64)&v->avail >> 32);
+    R(d, 0x0a0) = (u32)(u64)&v->used;   R(d, 0x0a4) = (u32)((u64)&v->used >> 32);
+    R(d, 0x044) = 1;                                    // queue ready
+    return 1;
+}
+static void card_give(volatile u32 *d, int q, struct vq *v, u16 first) {
+    v->avail.ring[v->avail.idx % QNUM] = first;
+    __sync_synchronize();
+    v->avail.idx++;
+    __sync_synchronize();
+    R(d, 0x050) = q;                                    // ring the card's doorbell
+}
+
+// ---------- THE DISK ----------
+// The whole file system is saved as ONE block of raw bytes (no layers).
+static volatile u32 *vio = 0;                           // the disk card
+static struct vq diskq;
 static struct { u32 type; u32 reserved; u64 sector; } blk_req;
 static volatile u8 blk_status;
-static u16 used_seen = 0;
 
 static int disk_init(void) {
-    for (int i = 0; i < 8; i++) {                       // look in all 8 slots for a disk
-        volatile u32 *r = (volatile u32 *)(VIRTIO_BASE + i * 0x1000UL);
-        if (r[0] == 0x74726976 && r[1] == 2 && r[2] == 2) { vio = r; break; }
-    }
+    vio = find_card(2);
     if (!vio) return 0;
-    VREG(0x070) = 0;                                    // reset
-    VREG(0x070) = 1 | 2;                                // "I see you" + "I have a driver"
-    VREG(0x024) = 0; VREG(0x020) = 0;                   // no extra features
-    VREG(0x024) = 1; VREG(0x020) = 1;                   // but speak modern virtio
-    VREG(0x070) = 1 | 2 | 8;                            // features OK
-    if (!(VREG(0x070) & 8)) return 0;
-    VREG(0x030) = 0;                                    // queue 0
-    if (VREG(0x034) < QNUM) return 0;
-    VREG(0x038) = QNUM;
-    VREG(0x080) = (u32)(u64)desc;   VREG(0x084) = (u32)((u64)desc >> 32);
-    VREG(0x090) = (u32)(u64)&avail; VREG(0x094) = (u32)((u64)&avail >> 32);
-    VREG(0x0a0) = (u32)(u64)&used;  VREG(0x0a4) = (u32)((u64)&used >> 32);
-    VREG(0x044) = 1;                                    // queue ready
-    VREG(0x070) = 1 | 2 | 8 | 4;                        // driver OK, disk is live
+    if (!card_start(vio) || !card_queue(vio, 0, &diskq)) { vio = 0; return 0; }
+    R(vio, 0x070) = 1 | 2 | 8 | 4;                      // driver OK, disk is live
     return 1;
 }
 
@@ -114,24 +139,67 @@ static int disk_rw(void *buf, u32 bytes, int write) {
     if (!vio) return 0;
     blk_req.type = write ? 1 : 0; blk_req.reserved = 0; blk_req.sector = 0;
     blk_status = 0xff;
-    desc[0] = (struct vq_desc){ (u64)&blk_req, sizeof blk_req, 1, 1 };
-    desc[1] = (struct vq_desc){ (u64)buf, bytes, (u16)(1 | (write ? 0 : 2)), 2 };
-    desc[2] = (struct vq_desc){ (u64)&blk_status, 1, 2, 0 };
-    avail.ring[avail.idx % QNUM] = 0;
-    __sync_synchronize();
-    avail.idx++;
-    __sync_synchronize();
-    VREG(0x050) = 0;                                    // ring the disk's doorbell
-    while (*(volatile u16 *)&used.idx == used_seen) {}  // wait until the disk is done
-    used_seen++;
-    VREG(0x064) = VREG(0x060);
+    diskq.desc[0] = (struct vq_desc){ (u64)&blk_req, sizeof blk_req, 1, 1 };
+    diskq.desc[1] = (struct vq_desc){ (u64)buf, bytes, (u16)(1 | (write ? 0 : 2)), 2 };
+    diskq.desc[2] = (struct vq_desc){ (u64)&blk_status, 1, 2, 0 };
+    card_give(vio, 0, &diskq, 0);
+    while (*(volatile u16 *)&diskq.used.idx == diskq.seen) {}   // wait until the disk is done
+    diskq.seen++;
+    R(vio, 0x064) = R(vio, 0x060);
     return blk_status == 0;
+}
+
+// ---------- THE NETWORK CARD ----------
+// Sends raw "Ethernet frames" (packets) to the other maddis-os window.
+// No internet layers (no IP, no TCP): just our own tiny format, starting with "MDOS".
+static volatile u32 *net = 0;
+static struct vq rxq, txq;                              // queue 0 = receive, queue 1 = send
+#define NET_HDR 12                                      // virtio puts 12 bytes in front of each packet
+#define FRAME_MAX 1514
+static u8 rxbuf[QNUM][NET_HDR + FRAME_MAX] __attribute__((aligned(16)));
+static u8 txbuf[NET_HDR + FRAME_MAX] __attribute__((aligned(16)));
+
+static int net_init(void) {
+    net = find_card(1);
+    if (!net) return 0;
+    if (!card_start(net) || !card_queue(net, 0, &rxq) || !card_queue(net, 1, &txq)) { net = 0; return 0; }
+    R(net, 0x070) = 1 | 2 | 8 | 4;                      // driver OK, network is live
+    for (int i = 0; i < QNUM; i++) {                    // hand the card empty boxes to fill
+        rxq.desc[i] = (struct vq_desc){ (u64)rxbuf[i], NET_HDR + FRAME_MAX, 2, 0 };
+        card_give(net, 0, &rxq, i);
+    }
+    return 1;
+}
+
+static void net_send(const u8 *frame, u32 len) {
+    if (!net) return;
+    for (u32 i = 0; i < NET_HDR; i++) txbuf[i] = 0;
+    copy_bytes(txbuf + NET_HDR, frame, len);
+    txq.desc[0] = (struct vq_desc){ (u64)txbuf, NET_HDR + len, 0, 0 };
+    card_give(net, 1, &txq, 0);
+    while (*(volatile u16 *)&txq.used.idx == txq.seen) {}      // wait until it's sent
+    txq.seen++;
+    R(net, 0x064) = R(net, 0x060);
+}
+
+// returns the length of a received frame (copied into out), or 0 if nothing came in
+static u32 net_receive(u8 *out) {
+    if (!net || *(volatile u16 *)&rxq.used.idx == rxq.seen) return 0;
+    u32 id  = rxq.used.ring[rxq.seen % QNUM].id;
+    u32 len = rxq.used.ring[rxq.seen % QNUM].len;
+    rxq.seen++;
+    len = len > NET_HDR ? len - NET_HDR : 0;
+    if (len > FRAME_MAX) len = FRAME_MAX;
+    copy_bytes(out, rxbuf[id] + NET_HDR, len);
+    card_give(net, 0, &rxq, id);                        // give the box back to the card
+    R(net, 0x064) = R(net, 0x060);
+    return len;
 }
 
 // ---------- SPEED TEST ----------
 #define TEST_COUNT 200000
 #define BIG 1024
-static struct { unsigned long head, tail; unsigned long slot[BIG]; } numbox;  // a mailbox for numbers
+static struct { unsigned long head, tail; unsigned long slot[BIG]; } numbox APP_MEM;  // a mailbox for numbers
 unsigned long os_sum;                    // the OS job: keep a total of the app's numbers
 
 // Old way: one trap into the OS for every single number.
@@ -213,7 +281,7 @@ static struct {
     unsigned rep_head, rep_tail;          // OS writes replies, app reads them
     struct { int op; char name[NAME_LEN]; char data[DATA_LEN]; } req[4];
     struct { int ok; char data[DATA_LEN]; } rep[4];
-} filebox;
+} filebox APP_MEM;
 
 // App side: ask the OS for a file job and wait for the answer. No traps.
 static int app_file(int op, const char *name, const char *data, char *answer) {
@@ -257,7 +325,40 @@ static void os_handle_filebox(void) {
 #define JOB_TRAPS  2
 #define JOB_NUMBOX 3
 #define JOB_FILES  4
-static volatile int app_job = JOB_NONE, app_count = 0, app_alive = 0;
+#define JOB_BAD    5
+volatile int app_job APP_MEM, app_count APP_MEM, app_alive APP_MEM;
+
+// The wall report: the trap handler (start.S) fills these in when the app hits a wall.
+// They live in OS memory, so the app can't fake them.
+volatile unsigned long wall_hits, wall_cause, wall_addr;
+
+// ================= CORE 1: BUILD THE WALLS, THEN START THE APP =================
+// RISC-V chips have walls built in, called PMP. We tell the chip:
+//   - the app may READ and RUN the OS code (but not change it)
+//   - the app may READ and WRITE only its own room (APP_MEM)
+//   - everything else: blocked. The chip checks every single memory access.
+// Then we drop core 1 from "machine mode" (all powers) to "user mode" (walled in).
+extern char _start[], rodata_end[], app_start[], app_end[], app_stack_top[];
+void app_main(void);
+void app_core_setup(void) {
+    asm volatile(
+        "csrw pmpaddr0, %0\n"
+        "csrw pmpaddr1, %1\n"
+        "csrw pmpaddr2, %2\n"
+        "csrw pmpaddr3, %3\n"
+        "csrw pmpcfg0,  %4\n"
+        :: "r"((u64)_start >> 2), "r"((u64)rodata_end >> 2),
+           "r"((u64)app_start >> 2), "r"((u64)app_end >> 2),
+           "r"((u64)0x0B000D00));          // entry 1: read+run code, entry 3: read+write app room
+    asm volatile(
+        "li   t0, 0x1800\n"
+        "csrc mstatus, t0\n"              // after mret, go to user mode (no powers)
+        "csrw mepc, %0\n"                 // ...and start at app_main
+        "mv   sp, %1\n"                   // with a stack inside the app's room
+        "mret\n"
+        :: "r"(app_main), "r"(app_stack_top) : "t0");
+    for (;;) {}
+}
 
 // ================= CORE 1: THE APP =================
 void app_main(void) {
@@ -275,7 +376,7 @@ void app_main(void) {
             mailbox_send("done!");
         }
         else if (job == JOB_FILES) {              // the app uses files, only through mailboxes
-            static char got[DATA_LEN];
+            static char got[DATA_LEN] APP_MEM;
             char line[64];
             mailbox_send("app (core 1): asking the OS to save app.txt...");
             int ok = app_file(OP_SAVE, "app.txt", "written by the app on core 1, through the mailbox", 0);
@@ -287,6 +388,12 @@ void app_main(void) {
             if (ok) { copy_max(line, got, 60); mailbox_send(line); }
             mailbox_send("app: 2 file jobs, 0 traps. type ls to see app.txt");
             mailbox_send("done!");
+        }
+        else if (job == JOB_BAD) {                // a "bad app" tries to break out
+            mailbox_send("bad app: trying to read your files directly...");
+            volatile char steal = fs.files[0].data[0];     // the chip should stop this
+            (void)steal;
+            mailbox_send("bad app: I read your files!  (this should never show)");
         }
         else if (job == JOB_TRAPS) {              // OLD WAY
             for (unsigned long i = 1; i <= TEST_COUNT; i++)
@@ -505,6 +612,72 @@ static void tree(void) {
     }
 }
 
+// ---------- TALKING TO THE OTHER maddis-os ----------
+// Our packet:  [6 bytes to] [6 bytes from] [2 bytes type 0x88B5] "MDOS" [kind] [name 16] [data...]
+#define KIND_CHAT 1
+#define KIND_FILE 2
+static u8 frame[FRAME_MAX];
+static u8 inbox[FRAME_MAX];
+static unsigned long net_sent = 0, net_got = 0;
+static void prompt(void);
+
+static void net_packet(int kind, const char *name, const char *data) {
+    if (!net) { print("  no network card. start with: make a   (and make b in another window)\r\n"); return; }
+    for (int i = 0; i < 6; i++) frame[i] = 0xff;            // to: everyone on the wire
+    const u8 me[6] = { 0x52, 0x54, 0x00, 0x4d, 0x44, 0x53 };
+    for (int i = 0; i < 6; i++) frame[6 + i] = me[i];
+    frame[12] = 0x88; frame[13] = 0xB5;                     // "this is a maddis-os packet"
+    frame[14] = 'M'; frame[15] = 'D'; frame[16] = 'O'; frame[17] = 'S';
+    frame[18] = (u8)kind;
+    for (int i = 0; i < NAME_LEN; i++) frame[19 + i] = 0;
+    copy_max((char *)frame + 19, name, NAME_LEN);
+    int n = length(data);
+    if (n > DATA_LEN) n = DATA_LEN;
+    copy_bytes(frame + 19 + NAME_LEN, data, n);
+    u32 len = 19 + NAME_LEN + n;
+    if (len < 60) { for (u32 i = len; i < 60; i++) frame[i] = 0; len = 60; }   // smallest allowed packet
+    net_send(frame, len);
+    net_sent++;
+}
+
+static void net_poll(void) {
+    u32 len = net_receive(inbox);
+    if (len < 19 + NAME_LEN) return;
+    if (inbox[12] != 0x88 || inbox[13] != 0xB5) return;      // not ours: ignore
+    if (inbox[14] != 'M' || inbox[15] != 'D' || inbox[16] != 'O' || inbox[17] != 'S') return;
+    static char name[NAME_LEN], data[DATA_LEN + 1];
+    copy_max(name, (char *)inbox + 19, NAME_LEN);
+    u32 n = len - 19 - NAME_LEN;
+    if (n > DATA_LEN) n = DATA_LEN;
+    copy_bytes(data, inbox + 19 + NAME_LEN, n);
+    data[n] = 0;
+    net_got++;
+    print("\r\n");
+    if (inbox[18] == KIND_CHAT) {
+        print("  " BLUE "[net]" RESET " the other maddis-os says: "); print(data); print("\r\n");
+    } else if (inbox[18] == KIND_FILE) {
+        struct file *f = file_write_in(0, name, data);
+        print("  " BLUE "[net]" RESET " got file "); print(name);
+        if (f) { print(" ("); print_num(f->size); print(" bytes). saved in /\r\n"); }
+        else print(", but the disk is full\r\n");
+    }
+    prompt();
+}
+
+static void send_file(const char *name) {
+    if (!*name) { print("  type: sendfile a.txt\r\n"); return; }
+    struct file *f = find_file_in(here, name);
+    if (!f) { print("  no file called "); print(name); print("\r\n"); return; }
+    net_packet(KIND_FILE, f->name, f->data);
+    if (net) { print("  sent "); print(f->name); print(" ("); print_num(f->size); print(" bytes) to the other maddis-os\r\n"); }
+}
+
+static void net_status(void) {
+    if (!net) { print("  network: none. start two windows with: make a   and   make b\r\n"); return; }
+    print("  network: card is live (0 internet layers, raw packets only)\r\n");
+    print("  sent "); print_num(net_sent); print(" packets, got "); print_num(net_got); print("\r\n");
+}
+
 static void command(char *line) {
     while (*line == ' ') line++;                         // ignore spaces at the start
     { int e = length(line); while (e > 0 && line[e - 1] == ' ') line[--e] = 0; }   // and at the end
@@ -530,6 +703,10 @@ static void command(char *line) {
         print("  tree          show every folder and file\r\n");
         print("  size          how many bytes maddis-os and your files use\r\n");
         print("  appfiles      the app on core 1 saves a file through the mailbox\r\n");
+        print("  badapp        a bad app tries to break out of its walls\r\n");
+        print("  send hi       send a message to the other maddis-os window\r\n");
+        print("  sendfile a.txt   send a file to the other maddis-os window\r\n");
+        print("  net           network status\r\n");
         print("  whoami        who you are\r\n");
         print("  uname         what OS this is\r\n");
         print("  cores         show what each core is doing\r\n");
@@ -549,6 +726,13 @@ static void command(char *line) {
     else if (same(line, "tree"))      tree();
     else if (same(line, "pwd"))       { print("  "); print_path(); print("\r\n"); }
     else if (same(line, "size"))      size_report();
+    else if (same(line, "badapp"))    { print("  OS: starting a bad app on core 1...\r\n"); STORE(app_job, JOB_BAD); }
+    else if (starts(line, "sendfile")) send_file(line[8] ? line + 9 : "");
+    else if (starts(line, "send"))    {
+        if (!line[4]) print("  type: send hello there\r\n");
+        else { net_packet(KIND_CHAT, "", line + 5); if (net) print("  sent.\r\n"); }
+    }
+    else if (same(line, "net"))       net_status();
     else if (same(line, "appfiles"))  { print("  OS: asking core 1 to use files through the mailbox...\r\n"); STORE(app_job, JOB_FILES); }
     else if (starts(line, "git") || starts(line, "make") || starts(line, "sudo") || starts(line, "apt"))
                                       linux_hint(line);
@@ -558,7 +742,7 @@ static void command(char *line) {
     else if (same(line, "speedtest")) speedtest();
     else if (same(line, "cores")) {
         print("  core 0: OS   - running, you're talking to it\r\n");
-        print(LOAD(app_alive) ? "  core 1: app  - running, waiting for a job\r\n"
+        print(LOAD(app_alive) ? "  core 1: app  - running in user mode, walled in by the chip\r\n"
                               : "  core 1: app  - not started\r\n");
     }
     else if (starts(line, "run")) {
@@ -571,6 +755,27 @@ static void command(char *line) {
     }
     else if (same(line, "exit"))      power_off();
     else { print("  unknown command: "); print(line); print("   (type help)\r\n"); }
+}
+
+static void print_hex(u64 v) {
+    print("0x");
+    for (int i = 60; i >= 0; i -= 4) putc("0123456789abcdef"[(v >> i) & 15]);
+}
+
+static unsigned long walls_seen = 0;
+static void prompt(void);
+static void check_walls(void) {
+    if (wall_hits == walls_seen) return;
+    walls_seen = wall_hits;
+    const char *what = "broke a rule";
+    if (wall_cause == 5) what = "tried to READ memory outside its room";
+    if (wall_cause == 7) what = "tried to WRITE memory outside its room";
+    if (wall_cause == 1) what = "tried to RUN code outside its room";
+    if (wall_cause == 2) what = "tried to use an OS-only instruction";
+    print("  " BLUE "[WALL]" RESET " the app on core 1 "); print(what); print("\r\n");
+    print("         at address "); print_hex(wall_addr); print(". the chip blocked it.\r\n");
+    print("         your files are safe. the app was restarted.\r\n");
+    prompt();
 }
 
 static void prompt(void) {
@@ -588,6 +793,7 @@ static void power_off(void) {
 
 void kmain(void) {
     int disk_ok = disk_init();
+    int net_ok = net_init();
     int loaded = disk_ok && fs_load();
     if (!loaded) {                                       // brand new disk (or no disk)
         fs.magic = FS_MAGIC; fs.version = 1;
@@ -610,6 +816,8 @@ void kmain(void) {
     if (loaded)       print("  disk: found your saved files.\r\n");
     else if (disk_ok) print("  disk: new disk, ready. files will be saved.\r\n");
     else              print("  disk: none. files live in memory only.\r\n");
+    print(net_ok ? "  net:  card found. try: send hello\r\n" : "");
+    print("  walls: on. the app on core 1 can only touch its own room.\r\n");
     print("  Type help to see commands. Press Ctrl+C twice to leave.\r\n\r\n");
     prompt();
 
@@ -617,6 +825,8 @@ void kmain(void) {
     int n = 0;
     char last = 0;
     for (;;) {                                           // the OS never sleeps
+        check_walls();                                   // 0) did the app hit a wall?
+        net_poll();                                      //    anything from the other maddis-os?
         os_handle_filebox();                             // 1) did the app ask for a file?
         if (mailbox_take(msg)) {                         // 2) any text from the app?
             print("  [mailbox] "); print(msg); print("\r\n");
