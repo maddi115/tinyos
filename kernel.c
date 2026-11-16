@@ -575,7 +575,7 @@ static void command(char *line) {
 
 static void prompt(void) {
     if (paste_mode) { print("  | "); return; }
-    print(BLUE "maddis-os:"); print_path(); print("> " RESET);
+    print(BLUE "maddis-os "); print_path(); print("> " RESET);
 }
 
 static int ctrl_c = 0;   // how many times Ctrl+C was pressed in a row
