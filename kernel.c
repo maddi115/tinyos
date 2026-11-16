@@ -424,7 +424,10 @@ static void make_folder(const char *name) {
 static void change_folder(const char *path) {
     if (path[0] == '~') path++;
     if (path[0] == '/') path++;
-    if (!*path || same(path, "..")) { here = 0; return; }
+    if (!*path || same(path, "..")) {
+        if (here == 0) print("  you're already at / (the top). there is nothing above it.\r\n");
+        here = 0; return;
+    }
     int f = find_folder(path);
     if (f < 0) { print("  no folder called "); print(path); print("   (make it with: mkdir "); print(path); print(")\r\n"); return; }
     here = f;
@@ -489,7 +492,23 @@ static void paste_line(const char *line) {
 }
 
 static void power_off(void);
+static void tree(void) {
+    print("  " BLUE "/" RESET "   (the top: nothing above this)\r\n");
+    for (int i = 0; i < MAX_FILES; i++) if (fs.files[i].used && fs.files[i].folder == 0) {
+        print("  |-- "); print(fs.files[i].name); print("   "); print_commas(fs.files[i].size); print(" bytes\r\n");
+    }
+    for (int d = 1; d < MAX_FOLDERS; d++) if (fs.folders[d].used) {
+        print("  |-- " BLUE); print(fs.folders[d].name); print("/" RESET "\r\n");
+        for (int i = 0; i < MAX_FILES; i++) if (fs.files[i].used && fs.files[i].folder == d) {
+            print("  |     |-- "); print(fs.files[i].name); print("   "); print_commas(fs.files[i].size); print(" bytes\r\n");
+        }
+    }
+}
+
 static void command(char *line) {
+    while (*line == ' ') line++;                         // ignore spaces at the start
+    { int e = length(line); while (e > 0 && line[e - 1] == ' ') line[--e] = 0; }   // and at the end
+    if (!*line) return;
     if (line[0] == '\'' || line[0] == '"') {           // so 'help' works too
         char *p = line; while (p[1]) { p[0] = p[1]; p++; } *p = 0;
         if (p > line && (p[-1] == '\'' || p[-1] == '"')) p[-1] = 0;
@@ -508,6 +527,7 @@ static void command(char *line) {
         print("  mkdir notes   make a folder\r\n");
         print("  cd notes      go into a folder (cd .. or cd / to go back)\r\n");
         print("  pwd           show which folder you are in\r\n");
+        print("  tree          show every folder and file\r\n");
         print("  size          how many bytes maddis-os and your files use\r\n");
         print("  appfiles      the app on core 1 saves a file through the mailbox\r\n");
         print("  whoami        who you are\r\n");
@@ -526,6 +546,7 @@ static void command(char *line) {
     else if (starts(line, "rm"))      file_delete(line[2] ? line + 3 : "");
     else if (starts(line, "mkdir"))   make_folder(line[5] ? line + 6 : "");
     else if (starts(line, "cd"))      change_folder(line[2] ? line + 3 : "");
+    else if (same(line, "tree"))      tree();
     else if (same(line, "pwd"))       { print("  "); print_path(); print("\r\n"); }
     else if (same(line, "size"))      size_report();
     else if (same(line, "appfiles"))  { print("  OS: asking core 1 to use files through the mailbox...\r\n"); STORE(app_job, JOB_FILES); }
