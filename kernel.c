@@ -38,6 +38,11 @@ static char *add_num(char *d, unsigned long n) {
     *d = 0; return d;
 }
 static void print_num(unsigned long n) { char b[24]; add_num(b, n); print(b); }
+static void print_commas(unsigned long n) {          // 11476 -> 11,476
+    if (n >= 1000) { print_commas(n / 1000); putc(',');
+        unsigned long r = n % 1000; putc('0' + r / 100); putc('0' + r / 10 % 10); putc('0' + r % 10); }
+    else print_num(n);
+}
 static int to_num(const char *s) { int n = 0; while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0'); return n; }
 static void copy_max(char *d, const char *s, int max) { int i = 0; while (s[i] && i < max - 1) { d[i] = s[i]; i++; } d[i] = 0; }
 static int length(const char *s) { int n = 0; while (s[n]) n++; return n; }
@@ -430,16 +435,19 @@ static void linux_hint(const char *line) {
     print("  type exit, then run it in your Ubuntu window (maddi/~$)\r\n");
 }
 
-extern char _start[], text_end[], kernel_end[];
+extern char _start[], text_end[], data_end[], kernel_end[];
 static void size_report(void) {
-    unsigned long code = text_end - _start, all = kernel_end - _start;
+    unsigned long code = text_end - _start, data = data_end - text_end, space = kernel_end - data_end;
     unsigned long used = 0; int n = 0;
     for (int i = 0; i < MAX_FILES; i++) if (fs.files[i].used) { used += fs.files[i].size; n++; }
-    print("  maddis-os code:      "); print_num(code); print(" bytes\r\n");
-    print("  OS in memory:        "); print_num(all);  print(" bytes (code + data + file space)\r\n");
-    print("  your files:          "); print_num(n); print(" files, "); print_num(used); print(" bytes\r\n");
-    print("  disk:                ");
-    if (vio) { print_num(FS_BYTES); print(" bytes saved per change\r\n"); }
+    print("  code (the OS itself):   "); print_commas(code);  print(" bytes\r\n");
+    print("  data (text, settings):  "); print_commas(data);  print(" bytes\r\n");
+    print("  ---------------------------------------\r\n");
+    print("  maddis-os total:        " BLUE); print_commas(code + data); print(" bytes" RESET "\r\n\r\n");
+    print("  empty space in memory:  "); print_commas(space); print(" bytes (for files, mailboxes, disk buffer)\r\n");
+    print("  your files:             "); print_num(n); print(" files, "); print_commas(used); print(" bytes\r\n");
+    print("  disk:                   ");
+    if (vio) { print_commas(FS_BYTES); print(" bytes saved per change\r\n"); }
     else print("none (files live in memory only)\r\n");
 }
 
@@ -575,6 +583,9 @@ void kmain(void) {
     print("  |_|  |_|\\__,_|\\__,_|\\__,_|_|___/      \\___/|___/\r\n");
     print(RESET "\r\n");
     print("  core 0 = OS, core 1 = app. Built from scratch, no Linux inside.\r\n");
+    print("  size: " BLUE); print_commas((unsigned long)(data_end - _start)); print(" bytes" RESET " (");
+    print_commas((unsigned long)(text_end - _start)); print(" code + ");
+    print_commas((unsigned long)(data_end - text_end)); print(" data). type size for more.\r\n");
     if (loaded)       print("  disk: found your saved files.\r\n");
     else if (disk_ok) print("  disk: new disk, ready. files will be saved.\r\n");
     else              print("  disk: none. files live in memory only.\r\n");

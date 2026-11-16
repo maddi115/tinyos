@@ -6,6 +6,7 @@ SECTIONS {
     text_end = .;              /* end of the code (used by the "size" command) */
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
+    data_end = .;              /* end of code + data (what gets loaded) */
     .bss : { *(.bss*) *(COMMON) }
     kernel_end = .;            /* end of the whole OS in memory */
     . = ALIGN(16);
