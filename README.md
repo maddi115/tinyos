@@ -6,6 +6,9 @@ No Linux code inside. No C library. Every line was written for this OS.
 It was inspired by Jonathan Blow's idea that operating systems got too complicated,
 and that a simpler OS, built for today's many-core computers, would be better.
 
+It also follows a rule from Terry Davis (TempleOS): **one person should be able to read and
+understand the whole OS.** maddis-os is about 660 lines (C + a little assembly) and about 22 KB.
+
 ---
 
 ## Is it Linux?
@@ -80,7 +83,7 @@ How we know there's no Linux inside:
 | File | What it does |
 |---|---|
 | `start.S` | The very first code that runs. Sends core 0 to the OS and core 1 to the app. Also holds the "old way" trap handler. |
-| `kernel.c` | The whole OS: screen, keyboard, mailbox, file system, commands, speed test. |
+| `kernel.c` | The whole OS: screen, keyboard, disk driver, mailboxes, file system, commands, speed test. |
 | `kernel.ld` | Tells the builder where in memory the OS goes (address `0x80000000`). |
 | `Makefile` | The build recipe. `make` builds, `make run` starts it. |
 
@@ -97,7 +100,23 @@ Simple on purpose. A file is **a name + its bytes**. That's it.
 | Each file has an owner, a group, permissions, 3 timestamps, links... | Name + bytes |
 | Supports dozens of file system types | One |
 
-Limits: up to 16 files, 128 bytes each. Files live in **memory**, so they disappear when you turn maddis-os off.
+**How it's saved:** the whole file system is one block of raw bytes in memory.
+Every time something changes, maddis-os copies that block straight to the disk (`disk.img`).
+When it boots, it copies the block back. No converting, no layers.
+
+Limits: 16 files, 1024 bytes each, 7 folders (one level deep).
+
+### Files through the mailbox
+
+The app on core 1 never touches files itself. It drops a request in a **file mailbox**
+("save app.txt", "read app.txt"), and the OS on core 0 does the job and puts the answer back.
+
+```
+App (core 1):  "save app.txt = ..."  --> FILE MAILBOX -->  OS (core 0) saves it
+App (core 1):  "read app.txt"        --> FILE MAILBOX -->  OS (core 0) sends it back
+```
+
+Type `appfiles` to watch it happen. 2 file jobs, 0 traps.
 
 ---
 
@@ -109,16 +128,22 @@ Limits: up to 16 files, 128 bytes each. Files live in **memory**, so they disapp
 | `clear` | clean the screen |
 | `echo hi` | print what you type |
 | `bytes hi` | see letters as bytes (8 on/off switches) |
-| `ls` | list files |
+| `ls` | list files, folders and how many bytes they use |
 | `write a.txt hi` | make a file called `a.txt` with `hi` inside |
+| `write a.txt` | then paste or type many lines, end with a line that is just `.` |
 | `cat a.txt` | show what's in a file |
 | `rm a.txt` | delete a file |
+| `mkdir notes` | make a folder |
+| `cd notes` | go into a folder (`cd ..` or `cd /` to go back) |
+| `pwd` | show which folder you're in |
+| `size` | how many bytes maddis-os and your files use |
+| `appfiles` | the app on core 1 saves and reads a file through the mailbox |
 | `whoami` | who you are |
 | `uname` | what OS this is |
 | `cores` | show what each core is doing |
 | `run 20` | core 1 sends 20 messages through the mailbox |
 | `speedtest` | old trap way vs. new mailbox way |
-| `exit` or **Ctrl+C twice** | turn off maddis-os and go back to Linux |
+| `exit` or **Ctrl+C twice** | turn off maddis-os (files stay on the disk) |
 
 ---
 
@@ -130,11 +155,13 @@ Install the tools once:
 sudo apt install -y gcc-riscv64-unknown-elf qemu-system-misc
 ```
 
-Build and start:
+Build and start (the first time, this also makes an empty 1 MB disk called `disk.img`):
 
 ```
 make run
 ```
+
+Erase all your files: `make wipe`
 
 Leave with **Ctrl+C twice**.
 
@@ -142,7 +169,7 @@ Leave with **Ctrl+C twice**.
 
 ## What it can't do (yet)
 
-- No real disk. Files disappear on exit.
+- Small disk: 16 files of 1 KB each.
 - No internet.
 - No graphics, windows or mouse. Just text.
 - No protection: the app could touch the OS's memory if it wanted to.
@@ -151,5 +178,6 @@ Leave with **Ctrl+C twice**.
 ## Ideas for next steps
 
 - **Boxes:** lock the app so it can't touch the OS's memory (needed for safe AI agents).
-- **Real disk:** save files so they survive a restart.
+- **Bigger disk:** more and bigger files.
+- **AMD version:** boot from a USB stick on a real PC.
 - **More apps on more cores**, each with its own mailbox.
