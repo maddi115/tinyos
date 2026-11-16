@@ -182,11 +182,21 @@ static void bytes(const char *word) {
 #define MAX_FILES 16
 #define NAME_LEN  16
 #define DATA_LEN  128
-static struct file { int used; char name[NAME_LEN]; char data[DATA_LEN]; int size; } files[MAX_FILES];
+static struct file { int used; int folder; char name[NAME_LEN]; char data[DATA_LEN]; int size; } files[MAX_FILES];
+
+// ---------- FOLDERS (one level: / and folders inside it) ----------
+#define MAX_FOLDERS 8
+static struct { int used; char name[NAME_LEN]; } folders[MAX_FOLDERS] = { { 1, "" } };  // folder 0 = "/"
+static int here = 0;                       // the folder you are in right now
 
 static struct file *find_file(const char *name) {
-    for (int i = 0; i < MAX_FILES; i++) if (files[i].used && same(files[i].name, name)) return &files[i];
+    for (int i = 0; i < MAX_FILES; i++)
+        if (files[i].used && files[i].folder == here && same(files[i].name, name)) return &files[i];
     return 0;
+}
+static int find_folder(const char *name) {
+    for (int i = 1; i < MAX_FOLDERS; i++) if (folders[i].used && same(folders[i].name, name)) return i;
+    return -1;
 }
 static void copy_max(char *d, const char *s, int max) { int i = 0; while (s[i] && i < max - 1) { d[i] = s[i]; i++; } d[i] = 0; }
 static int length(const char *s) { int n = 0; while (s[n]) n++; return n; }
@@ -196,6 +206,7 @@ static struct file *file_write(const char *name, const char *text) {
     for (int i = 0; !f && i < MAX_FILES; i++) if (!files[i].used) f = &files[i];
     if (!f) return 0;
     f->used = 1;
+    f->folder = here;
     copy_max(f->name, name, NAME_LEN);
     copy_max(f->data, text, DATA_LEN);
     f->size = length(f->data);
@@ -204,7 +215,11 @@ static struct file *file_write(const char *name, const char *text) {
 
 static void file_list(void) {
     int any = 0;
-    for (int i = 0; i < MAX_FILES; i++) if (files[i].used) {
+    if (here == 0) for (int i = 1; i < MAX_FOLDERS; i++) if (folders[i].used) {
+        print("  " BLUE); print(folders[i].name); print("/" RESET "   (folder)\r\n");
+        any = 1;
+    }
+    for (int i = 0; i < MAX_FILES; i++) if (files[i].used && files[i].folder == here) {
         print("  " BLUE); print(files[i].name); print(RESET "   ");
         print_num(files[i].size); print(" bytes\r\n");
         any = 1;
@@ -237,6 +252,35 @@ static void write_command(const char *args) {
     print("  saved "); print(f->name); print(" ("); print_num(f->size); print(" bytes)\r\n");
 }
 
+static void print_path(void) { print("/"); print(folders[here].name); }
+
+static void make_folder(const char *name) {
+    if (!*name) { print("  type: mkdir notes\r\n"); return; }
+    if (here != 0) { print("  folders can only go in /  (type: cd /)\r\n"); return; }
+    if (find_folder(name) >= 0) { print("  already exists\r\n"); return; }
+    for (int i = 1; i < MAX_FOLDERS; i++) if (!folders[i].used) {
+        folders[i].used = 1;
+        copy_max(folders[i].name, name, NAME_LEN);
+        print("  made folder "); print(folders[i].name); print("\r\n");
+        return;
+    }
+    print("  too many folders (7 max)\r\n");
+}
+
+static void change_folder(const char *path) {
+    if (path[0] == '~') path++;                      // treat ~ like /
+    if (path[0] == '/') path++;
+    if (!*path || same(path, "..")) { here = 0; return; }
+    int f = find_folder(path);
+    if (f < 0) { print("  no folder called "); print(path); print("   (make it with: mkdir "); print(path); print(")\r\n"); return; }
+    here = f;
+}
+
+static void linux_hint(const char *line) {
+    print("  '"); print(line); print("' is a Linux command, not a maddis-os one.\r\n");
+    print("  type exit, then run it in your Ubuntu window (maddi/~$)\r\n");
+}
+
 static void command(char *line) {
     if (line[0] == '\'' || line[0] == '"') {           // so 'help' works too
         char *p = line; while (p[1]) { p[0] = p[1]; p++; } *p = 0;
@@ -252,6 +296,9 @@ static void command(char *line) {
         print("  write a.txt hi   make a file called a.txt with hi inside\r\n");
         print("  cat a.txt     show what is in a file\r\n");
         print("  rm a.txt      delete a file\r\n");
+        print("  mkdir notes   make a folder\r\n");
+        print("  cd notes      go into a folder (cd .. or cd / to go back)\r\n");
+        print("  pwd           show which folder you are in\r\n");
         print("  whoami        who you are\r\n");
         print("  uname         what OS this is\r\n");
         print("  cores         show what each core is doing\r\n");
@@ -266,6 +313,11 @@ static void command(char *line) {
     else if (starts(line, "write"))   write_command(line[5] ? line + 6 : "");
     else if (starts(line, "cat"))     file_read(line[3] ? line + 4 : "");
     else if (starts(line, "rm"))      file_delete(line[2] ? line + 3 : "");
+    else if (starts(line, "mkdir"))   make_folder(line[5] ? line + 6 : "");
+    else if (starts(line, "cd"))      change_folder(line[2] ? line + 3 : "");
+    else if (same(line, "pwd"))       { print("  "); print_path(); print("\r\n"); }
+    else if (starts(line, "git") || starts(line, "make") || starts(line, "sudo") || starts(line, "apt"))
+                                      linux_hint(line);
     else if (same(line, "whoami"))    print("  user\r\n");
     else if (same(line, "uname"))     print("  maddis-os (not Linux, built from scratch)\r\n");
     else if (same(line, "hello"))     print("  hello from your own OS!\r\n");
@@ -287,7 +339,7 @@ static void command(char *line) {
     else { print("  unknown command: "); print(line); print("   (type help)\r\n"); }
 }
 
-#define PROMPT BLUE "maddis-os> " RESET
+static void prompt(void) { print(BLUE "maddis-os:"); print_path(); print("> " RESET); }
 
 static int ctrl_c = 0;   // how many times Ctrl+C was pressed in a row
 
@@ -303,21 +355,21 @@ void kmain(void) {
     print(RESET "\r\n");
     print("  core 0 = OS, core 1 = app. Built from scratch, no Linux inside.\r\n");
     print("  Type help to see commands. Press Ctrl+C twice to leave.\r\n\r\n");
-    print(PROMPT);
+    prompt();
 
     char line[64], msg[48];
     int n = 0;
     for (;;) {                                           // the OS never sleeps
         if (mailbox_take(msg)) {                         // 1) check the mailbox
             print("  [mailbox] "); print(msg); print("\r\n");
-            if (same(msg, "done!")) print(PROMPT);
+            if (same(msg, "done!")) prompt();
         }
         if (key_ready()) {                               // 2) check the keyboard
             char c = UART_DATA;
             if (c == 3) {                                // Ctrl+C
                 if (ctrl_c) { print("\r\n  bye!\r\n"); POWER = 0x5555; for (;;) {} }
                 ctrl_c = 1;
-                print("^C   (press Ctrl+C again to exit)\r\n" PROMPT);
+                print("^C   (press Ctrl+C again to exit)\r\n"); prompt();
                 n = 0;
                 continue;
             }
@@ -327,7 +379,7 @@ void kmain(void) {
                 line[n] = 0;
                 if (n > 0) command(line);
                 n = 0;
-                if (LOAD(app_job) != JOB_TEXT) print(PROMPT);
+                if (LOAD(app_job) != JOB_TEXT) prompt();
             }
             else if ((c == 127 || c == 8) && n > 0) { n--; print("\b \b"); }
             else if (c >= 32 && c < 127 && n < 63) { line[n++] = c; putc(c); }
